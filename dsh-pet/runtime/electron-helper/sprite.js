@@ -205,6 +205,36 @@ class PetSprite {
       e.preventDefault();
       this.toggleBalanceDetail();
     });
+    // 操作授权卡片：与气泡同处 this.el 内的绝对定位浮层（压在宠物身上——贴屏幕顶边时
+    // 头顶的余量区会被窗口上边缘裁掉，身体区域一定在屏幕内）。只在 host 的
+    // sections.approval 有 pending 时显示；按钮走 /approval/answer。
+    this.approval = null; // 当前 ApprovalItem（shared/approval 的视图）
+    this.approvalCount = 0;
+    this.approvalOpen = false;
+    this.approvalBusy = false;
+    this.approvalError = '';
+    // 授权卡片来源：host = 真实审批；demo = 右键「测试弹窗」注入的本地演示（不 POST）。
+    this.approvalSource = 'host';
+    this.approvalDemoOpen = false;
+    // 最近一次真实审批快照：演示卡片盖住它时先存着，演示收起后立刻还原。
+    this.hostApproval = null;
+    this.hostApprovalCount = 0;
+    // 为了让卡片完整贴在头顶上方，弹窗期间临时加高窗口上边距；关闭时还原。
+    this.baseMarginT = this.margin.t;
+    this.approvalRestore = null;
+    this.approvalEl = document.createElement('div');
+    this.approvalEl.className = 'dsh-pet-approval';
+    this.approvalEl.setAttribute('role', 'dialog');
+    this.approvalEl.setAttribute('aria-live', 'polite');
+    this.approvalEl.style.display = 'none';
+    this.approvalEl.addEventListener('pointerdown', (e) => e.stopPropagation());
+    this.approvalEl.addEventListener('click', (e) => {
+      const target = e.target && e.target.closest ? e.target.closest('[data-approval-decision]') : null;
+      if (!target) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.answerApproval(target.getAttribute('data-approval-decision'));
+    });
     // 悬浮提示：与气泡同处 this.el 内的绝对定位浮层，位置/翻转由 renderTip 决定，
     // 样式走 shared 的 TOOLTIP_CSS（renderer.js 注入，与浏览器端同一份）
     this.tip = document.createElement('div');
@@ -215,6 +245,7 @@ class PetSprite {
     stage.appendChild(this.videoB);
     stage.appendChild(this.hit);
     this.el.appendChild(this.bubble);
+    this.el.appendChild(this.approvalEl);
     this.el.appendChild(this.tip);
     this.el.appendChild(stage);
     rootEl.appendChild(this.el);
@@ -1409,7 +1440,9 @@ class PetSprite {
   inputBusy() {
     // 可点的余额气泡是第四个来源：它同样长在窗口里、同样靠窗口级 click 触发，而它悬在宠物头顶的
     // 余量区——那一块平时是穿透的，正需要借 busy + 控件矩形把它"圈"出来（见 syncInputRegions）。
-    return this.dragState.active || this.menuOpen || this.chatOpen || this.balanceClickable();
+    // 授权卡片是第五个来源：它压在身体上、靠窗口级 click 作答；卡片矩形已登记进
+    // setInputRegions，主进程兜底通道据此只在卡片/身体上保持可交互。
+    return this.dragState.active || this.menuOpen || this.chatOpen || this.balanceClickable() || this.approvalOpen;
   }
 
   /**
@@ -1440,7 +1473,9 @@ class PetSprite {
     const rects = [];
     // 控件矩形 = 主进程允许接收点击的区域（矩形外的余量区继续穿透）。
     // .pet-bubble.is-clickable 是余额气泡的展开态：它悬在宠物头顶的余量区，不登记就点不到。
-    const controls = [...document.querySelectorAll('.dsh-pet-menu-column, .dsh-pet-chat, .pet-bubble.is-clickable')];
+    const controls = [
+      ...document.querySelectorAll('.dsh-pet-menu-column, .dsh-pet-chat, .pet-bubble.is-clickable, .dsh-pet-approval'),
+    ];
     for (const el of this.inputRegionElements) {
       if (!controls.includes(el)) {
         this.inputRegionResize.unobserve(el);
@@ -1552,12 +1587,20 @@ class PetSprite {
     const px = wx - this.margin.l;
     const py = wy - this.margin.t;
     const inBody = px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
+    // 授权卡片压在身体上但比命中区宽：卡片自己的矩形也要算可交互，否则按钮两侧会穿透。
+    // 只认卡片可见时的矩形（display:none 时 getBoundingClientRect 全 0，不会误命中）。
+    let inApproval = false;
+    if (this.approvalOpen) {
+      const card = this.approvalEl.getBoundingClientRect();
+      inApproval = wx >= card.left && wx <= card.right && wy >= card.top && wy <= card.bottom;
+    }
     // 光标位置存**视口坐标**（窗口原点 + 窗口内坐标）：窗口随宠物移动时贴光标不会漂，见 renderTip。
     // 必须在 setTip 之前更新：setTip 变显隐时会立刻渲染一次，晚一步就会用上一次的光标摆位。
     if (inBody) this.tipCursor = { x: this.pos.x - this.margin.l + wx, y: this.pos.y - this.margin.t + wy };
-    this.setInteractive(inBody);
-    // 悬浮提示与可交互判定同源（同一个 inBody）：光标进身体 → 提示出现，离开 → 收起
-    this.setTip(inBody);
+    this.setInteractive(inBody || inApproval);
+    // 悬浮提示与可交互判定同源（同一个 inBody）：光标进身体 → 提示出现，离开 → 收起；
+    // 光标在授权卡片上时让位（卡片 z-index 更高，提示只会从卡片底下透出来）。
+    this.setTip(inBody && !inApproval);
     // 跟随光标：位置依赖光标，所以每次移动都得重摆一次（setTip 只在显隐变化时才渲染）
     if (this.tipOn) this.renderTip();
   }
@@ -1644,6 +1687,8 @@ class PetSprite {
       // 为什么不就地关窗/开窗：桌面宠物共用一个 Electron 进程，窗口是进程启动时按 DSH_PET_PETS
       // 一次性建的——就地增删窗口既改不了磁盘配置（下次启动又回来）也改不了窗口数量。
       S.displayMenuBranch(),
+      // 本地测试弹窗：不经过宿主、不执行任何命令，只把授权卡片弹出来看效果；再点一次收起。
+      { label: this.approvalDemoOpen ? '隐藏测试弹窗' : '测试弹窗', action: 'approval-demo' },
       // 改配置文件后免去回设置页点保存：请宿主重启桌面 Helper（全部桌面宠物窗口按最新配置重建）。
       // 放在最后：它是"重新加载"这类维护动作，与上面几个宠物互动项语义不同。
       { label: '重载配置', action: 'reload' },
@@ -1706,6 +1751,10 @@ class PetSprite {
     }
     if (leaf.action === 'chat') {
       this.showChatFromMenu(); // 打开对话弹窗（记忆经 host /chat 读写，浏览器/桌面同一实例共享）
+      return;
+    }
+    if (leaf.action === 'approval-demo') {
+      this.toggleApprovalDemo(); // 本地演示：不经过宿主、不执行任何命令
       return;
     }
     if (leaf.action === 'home') {
@@ -1857,6 +1906,244 @@ class PetSprite {
       body: JSON.stringify({ id: this.pet.id, display }),
     }).catch((e) => {
       console.warn('[dsh-pet] 显示位置请求失败（宿主不可达？）', e);
+    });
+  }
+
+  // ---- 操作授权（approval） ----
+  /**
+   * 接住 host 投影过来的一条待处理授权。`item` 为 null = 队列已空 / 已被另一端回答。
+   *
+   * 卡片挂在**宠物头顶上方**的透明余量里，不再压住宠物。宠物贴近屏幕顶边时，
+   * `ensureApprovalVisible()` 会临时加高窗口上边距并把宠物往下让一点，保证卡片完整可见。
+   * `source: 'demo'` = 右键「测试弹窗」注入的本地演示，不经过宿主、不执行任何命令。
+   */
+  setApproval(item, count, source) {
+    const next = item && typeof item === 'object' && typeof item.id === 'string' ? item : null;
+    const total = typeof count === 'number' && Number.isFinite(count) ? count : next ? 1 : 0;
+    if (source === 'demo') {
+      this.approvalSource = 'demo';
+      this.approvalDemoOpen = !!next;
+    } else {
+      // 记下最近一次真实审批快照：演示收起后若它还在，要立刻重新显示。
+      this.hostApproval = next;
+      this.hostApprovalCount = total;
+      if (next) {
+        // 真实审批优先于本地演示：直接顶掉演示卡片。
+        this.approvalSource = 'host';
+        this.approvalDemoOpen = false;
+      } else if (this.approvalSource === 'demo') {
+        // host 的“空队列”不能把本地演示收掉——两者是独立的来源。
+        return;
+      }
+    }
+    if (!next) {
+      if (!this.approvalOpen && !this.approval) return;
+      this.approval = null;
+      this.approvalCount = 0;
+      this.approvalOpen = false;
+      this.approvalBusy = false;
+      this.approvalError = '';
+      this.approvalEl.style.display = 'none';
+      this.approvalEl.innerHTML = '';
+      this.approvalEl.classList.remove('is-answering', 'is-error');
+      window.__dshPetDebug.approvalOpen = false;
+      this.syncInputBusy();
+      this.restoreApprovalLayout();
+      return;
+    }
+    const changed = !this.approval || this.approval.id !== next.id;
+    this.approval = next;
+    this.approvalCount = total;
+    if (changed) {
+      // 新请求：清掉上一条的忙碌/错误态，并停住漫游——卡片要跟着宠物，走动会让人追着点。
+      this.approvalBusy = false;
+      this.approvalError = '';
+      this.stopMove();
+    }
+    this.approvalOpen = true;
+    window.__dshPetDebug.approvalOpen = true;
+    this.approvalEl.style.display = 'block';
+    this.renderApproval();
+    this.ensureApprovalVisible();
+    this.syncInputBusy();
+  }
+
+  /** 收起本地演示卡片；若它下面还压着一条真实审批，立刻把真实卡片还原。 */
+  hideApprovalDemo() {
+    this.approvalDemoOpen = false;
+    if (this.hostApproval) this.setApproval(this.hostApproval, this.hostApprovalCount, 'host');
+    else this.setApproval(null, 0, 'demo');
+  }
+
+  /** 右键「测试弹窗 / 隐藏测试弹窗」的开关。 */
+  toggleApprovalDemo() {
+    if (this.approvalSource === 'demo' && this.approvalOpen) {
+      this.hideApprovalDemo();
+      return;
+    }
+    this.setApproval(
+      {
+        id: 'demo-local',
+        toolName: 'bash',
+        reason: '【测试】允许本次操作使用 danger-full-access 权限：这是一条桌宠授权卡片演示，不会真的执行任何命令。',
+        detail: 'Write-Output "桌宠授权测试：点「同意」或「拒绝」只会关闭这张卡片"',
+        sessionId: 'demo-session-000000',
+        createdAt: Date.now(),
+      },
+      1,
+      'demo',
+    );
+  }
+
+  /**
+   * 让头顶卡片完整可见：
+   *  1. 先按卡片实测高度临时加高窗口上边距（否则卡片会超出窗口上边缘被裁）；
+   *  2. 若卡片顶仍高于屏幕工作区，把宠物整体往下让，直到卡片顶进入工作区。
+   * 关闭卡片时由 `restoreApprovalLayout()` 还原边距与位置（用户拖拽过则不还原）。
+   */
+  ensureApprovalVisible() {
+    const card = this.approvalEl;
+    if (!this.approvalOpen || !this.approval) return;
+    const rect = card.getBoundingClientRect();
+    if (rect.height <= 0) return;
+    const gap = 10;
+    const wantedTopMargin = Math.ceil(rect.height + gap + 10);
+    if (wantedTopMargin > this.margin.t) {
+      this.margin.t = wantedTopMargin;
+      this.el.style.top = this.margin.t + 'px';
+      this.sendBounds(this.pos.x, this.pos.y);
+    }
+    // 重新取卡片相对窗口的位置（改上边距后布局已变）
+    const after = card.getBoundingClientRect();
+    const area = S.resolveRect(WORK_AREAS, this.pos.x + this.halfW, this.pos.y + this.halfH);
+    const areaTopScreen = (area ? area.y : 0) + VIEW.y + 4;
+    const cardTopScreen = this.pos.y + VIEW.y - this.margin.t + after.top;
+    const shift = Math.max(0, areaTopScreen - cardTopScreen);
+    if (shift < 1) return;
+    if (!this.approvalRestore) {
+      this.approvalRestore = {
+        customPos: this.customPos ? { ...this.customPos } : null,
+        x: this.pos.x,
+        y: this.pos.y,
+        shiftedY: this.pos.y + shift,
+        marginT: this.baseMarginT,
+      };
+    } else {
+      this.approvalRestore.shiftedY = this.pos.y + shift;
+    }
+    this.customPos = {
+      rx: (this.pos.x + this.halfW) / VIEW.w,
+      ry: (this.pos.y + shift + this.halfH) / VIEW.h,
+    };
+    this.position();
+  }
+
+  /** 关闭卡片后还原被临时加高的上边距 / 被下移的宠物位置。 */
+  restoreApprovalLayout() {
+    if (this.margin.t !== this.baseMarginT) {
+      this.margin.t = this.baseMarginT;
+      this.el.style.top = this.margin.t + 'px';
+    }
+    const saved = this.approvalRestore;
+    this.approvalRestore = null;
+    if (saved && Math.abs(this.pos.y - saved.shiftedY) <= 2) {
+      // 用户没在弹窗期间拖走宠物才还原；否则尊重用户刚放下的位置。
+      this.customPos = saved.customPos;
+      this.position();
+      return;
+    }
+    this.sendBounds(this.pos.x, this.pos.y);
+  }
+
+  /** 重绘授权卡片（内容全部 textContent，不拼 HTML，避免把工具参数当标记解释）。 */
+  renderApproval() {
+    const item = this.approval;
+    if (!this.approvalOpen || !item) return;
+    const make = (tag, cls, text) => {
+      const node = document.createElement(tag);
+      if (cls) node.className = cls;
+      if (text !== undefined) node.textContent = text;
+      return node;
+    };
+    this.approvalEl.innerHTML = '';
+    this.approvalEl.classList.toggle('is-answering', this.approvalBusy);
+    this.approvalEl.classList.toggle('is-error', !!this.approvalError);
+
+    const head = make('div', 'dsh-pet-approval-head');
+    head.appendChild(make('div', 'dsh-pet-approval-mark', '!'));
+    const headText = make('div', 'dsh-pet-approval-headtext');
+    headText.appendChild(make('div', 'dsh-pet-approval-title', '需要你的授权'));
+    const sub = make('div', 'dsh-pet-approval-sub');
+    sub.appendChild(document.createTextNode('工具 '));
+    sub.appendChild(make('span', 'dsh-pet-approval-tool', item.toolName));
+    if (item.sessionId) {
+      const short = String(item.sessionId).slice(-6);
+      sub.appendChild(document.createTextNode(' · 会话 ' + short));
+    }
+    const queue = S.approvalQueueText(this.approvalCount);
+    if (queue) sub.appendChild(document.createTextNode(' · ' + queue));
+    headText.appendChild(sub);
+    head.appendChild(headText);
+    this.approvalEl.appendChild(head);
+
+    this.approvalEl.appendChild(make('div', 'dsh-pet-approval-reason', item.reason));
+    if (item.detail) this.approvalEl.appendChild(make('div', 'dsh-pet-approval-detail', item.detail));
+
+    const actions = make('div', 'dsh-pet-approval-actions');
+    const deny = make('button', 'dsh-pet-approval-btn dsh-pet-approval-deny', '拒绝');
+    deny.type = 'button';
+    deny.setAttribute('data-approval-decision', 'rejected');
+    deny.disabled = this.approvalBusy;
+    const allow = make('button', 'dsh-pet-approval-btn dsh-pet-approval-allow', '同意');
+    allow.type = 'button';
+    allow.setAttribute('data-approval-decision', 'allowed-once');
+    allow.disabled = this.approvalBusy;
+    actions.appendChild(deny);
+    actions.appendChild(allow);
+    this.approvalEl.appendChild(actions);
+
+    const hint = make(
+      'div',
+      'dsh-pet-approval-hint',
+      this.approvalError || (this.approvalBusy ? '已提交，等待生效…' : '同意仅对本次操作生效'),
+    );
+    this.approvalEl.appendChild(hint);
+  }
+
+  /**
+   * 回答当前授权。成功不立刻收卡片——由 host 的 /state 推送空队列来收，
+   * 这样“点了但还没生效”与“已经生效”在观感上不会闪一下。
+   */
+  answerApproval(decision) {
+    const item = this.approval;
+    if (!item || this.approvalBusy) return;
+    if (decision !== 'allowed-once' && decision !== 'rejected') return;
+    if (this.approvalSource === 'demo') {
+      // 本地演示：不 POST，点任一按钮都只收起卡片。
+      this.hideApprovalDemo();
+      return;
+    }
+    const id = item.id;
+    this.approvalBusy = true;
+    this.approvalError = '';
+    this.renderApproval();
+    S.postAction(BASE + '/approval/answer', { id, outcome: decision }).then((ok) => {
+      if (ok) {
+        // 兜底：正常 <1s 就会被 /state 清掉；5s 还没清说明状态没回来，解锁让用户重试。
+        setTimeout(() => {
+          if (this.approval && this.approval.id === id && this.approvalBusy) {
+            this.approvalBusy = false;
+            this.approvalError = '已提交，但状态还没回来';
+            this.renderApproval();
+          }
+        }, 5000);
+        return;
+      }
+      if (this.approval && this.approval.id === id) {
+        this.approvalBusy = false;
+        this.approvalError = '提交失败，请重试';
+        this.renderApproval();
+      }
     });
   }
 

@@ -159,6 +159,7 @@ import {
 } from './notify-events';
 import { profileNameFrom, storageEntries } from './storage-paths';
 import { parseStateWaitQuery, PollStateStore } from './state';
+import { ApprovalBroker, truncateDetail, type ApprovalDecision } from './approval';
 import { composeSystemPrompt, petPersona } from './persona';
 import {
   HelperProcess,
@@ -351,6 +352,86 @@ export function apply(ctx: any): void {
   // 轮询统一状态（S）：前端 1s 轮询的**唯一**数据源（余额 / 工作状态 / 通知 / 宠物说话）。
   // 所有写入走 state.writeSection / writePet（由它统一更新 counter），见 ./state 的说明。
   const state = new PollStateStore();
+  // 操作授权：待处理请求写进 sections.approval；两端轮询读到后把卡片压在宠物身上。
+  // **只有渲染端仍活着时才接**（见下面的 approvalSurfaceReady）：没有端能作答时 next()
+  // 把请求交还官方审批通道，绝不制造“卡片永远没人点”的挂起。
+  const approvals = new ApprovalBroker((views) => state.writeSection('approval', { pending: views }));
+  /** 渲染端还活着的租约时长：前端每 1s 长轮询一拍，12s 容忍切后台/短暂断网。 */
+  const APPROVAL_SURFACE_TTL_MS = 12_000;
+  const approvalSurfaceSeen = new Map<string, number>();
+  const noteApprovalSurface = (raw: string | null): void => {
+    if (raw !== 'web' && raw !== 'desktop') return;
+    approvalSurfaceSeen.set(raw, Date.now());
+  };
+  /** 配置里是否真有 display 包含该端的宠物（display:none / 只有另一端时不接）。 */
+  const surfaceHasVisiblePet = (surface: 'web' | 'desktop'): boolean => {
+    try {
+      const pets = flattenPetList(readAllConfig(configPaths));
+      return pets.some((pet) => displayCovers(surface, String(pet.display ?? '')));
+    } catch {
+      return false;
+    }
+  };
+  const approvalSurfaceReady = (): boolean => {
+    const now = Date.now();
+    for (const surface of ['web', 'desktop'] as const) {
+      const seen = approvalSurfaceSeen.get(surface) ?? 0;
+      if (now - seen <= APPROVAL_SURFACE_TTL_MS && surfaceHasVisiblePet(surface)) return true;
+    }
+    return false;
+  };
+  /** 从 tool/call 事件参数里取一段人能读的预览（命令 / 路径 / JSON 摘要）。 */
+  const previewToolCall = (data: unknown): string | undefined => {
+    const payload = data as { name?: unknown; arguments?: unknown } | null;
+    let args: unknown = payload?.arguments;
+    if (typeof args === 'string') {
+      const raw = args;
+      try {
+        args = JSON.parse(raw);
+      } catch {
+        return raw.trim() ? truncateDetail(raw) : undefined;
+      }
+    }
+    if (!args || typeof args !== 'object' || Array.isArray(args)) return undefined;
+    const record = args as Record<string, unknown>;
+    for (const key of ['command', 'cmd', 'path', 'file_path', 'query', 'url', 'pattern']) {
+      const value = record[key];
+      if (typeof value === 'string' && value.trim()) return truncateDetail(value);
+    }
+    try {
+      const json = JSON.stringify(record);
+      return json && json !== '{}' ? truncateDetail(json) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  /** 用 callId 在本会话最近的 tool/call 里反查参数；找不到就只显示 reason。 */
+  const approvalDetailOf = (request: unknown): string | undefined => {
+    const req = request as { agent?: { session?: unknown }; callId?: unknown } | null;
+    const session = req?.agent?.session as
+      | { seq?: unknown; eventAt?: (seq: number) => unknown }
+      | undefined;
+    const callId = typeof req?.callId === 'string' ? req.callId : '';
+    const seq = Number(session?.seq);
+    if (!callId || !Number.isFinite(seq) || seq <= 0 || typeof session?.eventAt !== 'function') return undefined;
+    const from = Math.max(0, seq - 500);
+    for (let i = seq - 1; i >= from; i -= 1) {
+      try {
+        const event = session.eventAt(i) as { type?: string; data?: { callId?: unknown } } | null;
+        if (event?.type === 'tool/call' && event.data?.callId === callId) return previewToolCall(event.data);
+      } catch {
+        return undefined;
+      }
+    }
+    return undefined;
+  };
+  /** 会话 id 只取短标识展示；不把整个会话对象投影出去。 */
+  const approvalSessionIdOf = (request: unknown): string | undefined => {
+    const session = (request as { agent?: { session?: { id?: unknown; header?: { id?: unknown } } } } | null)?.agent
+      ?.session;
+    const id = session?.header?.id ?? session?.id;
+    return typeof id === 'string' && id ? id : undefined;
+  };
   // 第三方右键菜单注册表（issue：第三方菜单项）：**进程内存态**，不落盘，重启即空。
   // 与 S 的关系：注册表本身写进 S 的 sections.menu（两端据此拼「更多」）；点击事件**不进 S**——
   // 它是触发不是状态，走 /menu/events 的读取即消费，只给注册它的那个 owner 看。见 ./menu 的说明。
@@ -1465,6 +1546,27 @@ export function apply(ctx: any): void {
       }
     }
 
+    // 操作授权回答：/dsh-pet-7340/approval/answer（POST）
+    // 两端（网页 / 桌面）共用；先点的一端起效，另一端起随后从 /state 的 approval 叶子消失。
+    // 业务失败（id 过期 / 已被另一端回答）一律 200 + {ok:false, reason:'stale'}，
+    // 与其它动作端点同一口径——“这条已经不用答了”不是传输层错误。
+    if (rest === 'approval/answer') {
+      if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      let payload: { id?: unknown; outcome?: unknown };
+      try {
+        payload = JSON.parse(body ?? '') as { id?: unknown; outcome?: unknown };
+      } catch {
+        return { kind: 'json', status: 400, obj: { error: 'invalid JSON body' } };
+      }
+      const id = typeof payload.id === 'string' ? payload.id.trim() : '';
+      const outcome = payload.outcome;
+      if (!id) return { kind: 'json', status: 400, obj: { error: 'id required' } };
+      if (outcome !== 'allowed-once' && outcome !== 'rejected') {
+        return { kind: 'json', status: 400, obj: { error: 'outcome must be allowed-once or rejected' } };
+      }
+      return { kind: 'json', status: 200, obj: approvals.answer(id, outcome as ApprovalDecision) };
+    }
+
     // 轮询统一状态（S）：/dsh-pet-7340/state（GET，no-cache）——前端轮询的**唯一**数据源
     // （余额 / 工作状态 / 通知 / 配置变更信号 / 宠物说话，形状见 ./state）。
     // 只读、纯内存、**零副作用**：绝不在这里触发外部调用或模型生成——那会把所有人的轮询拖死；
@@ -1478,6 +1580,8 @@ export function apply(ctx: any): void {
     // 这边是"任意叶子被写过"，所以等待者是全局集合，一次写入唤醒所有人。
     if (rest === 'state') {
       if (method !== 'GET') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      // 渲染端租约：有 web / desktop 在轮询才把 approval/request 接到桌宠上。
+      noteApprovalSurface(url.searchParams.get('surface'));
       const headers = { 'cache-control': 'no-cache, no-store' };
       const parsed = parseStateWaitQuery(url.searchParams.get('since'), url.searchParams.get('timeout'));
       if (parsed.kind === 'error') return { kind: 'json', status: 400, obj: { error: parsed.error } };
@@ -2413,6 +2517,49 @@ export function apply(ctx: any): void {
       errorDispose();
     };
   }, 'dsh-pet: notify frames');
+
+  // 操作授权：把 DSH 的 approval/request 瀑布接到桌宠上（prepend = 抢在官方 remote
+  // 审批通道之前）。没有渲染端能作答时调用 next()，行为与装插件前完全一致。
+  // 请求在用户点「同意 / 拒绝」时经 POST /approval/answer 解析；signal 中止时按 cancelled
+  // 收尾（浏览器关页 / 用户中断回合都会走到那里）。
+  ctx.effect(() => {
+    const dispose = ctx.on(
+      'approval/request',
+      (request: unknown, next: () => Promise<unknown>) => {
+        if (!approvalSurfaceReady()) return next();
+        try {
+          const req = request as {
+            toolName?: unknown;
+            callId?: unknown;
+            reason?: unknown;
+            displayReason?: unknown;
+            signal?: AbortSignal;
+          };
+          const toolName = typeof req.toolName === 'string' && req.toolName ? req.toolName : 'tool';
+          const sessionId = approvalSessionIdOf(request);
+          const detail = approvalDetailOf(request);
+          return approvals.request({
+            toolName,
+            ...(typeof req.callId === 'string' ? { callId: req.callId } : {}),
+            ...(typeof req.reason === 'string' ? { reason: req.reason } : {}),
+            ...(req.displayReason === undefined ? {} : { displayReason: req.displayReason }),
+            ...(req.signal === undefined ? {} : { signal: req.signal }),
+            ...(sessionId === undefined ? {} : { sessionId }),
+            ...(detail === undefined ? {} : { detail }),
+          });
+        } catch (e) {
+          // 接住失败（形状异常 / 队列满）时退回官方通道，绝不把审批吞掉。
+          console.error('[dsh-pet] approval projection failed, falling back:', e);
+          return next();
+        }
+      },
+      true,
+    );
+    return () => {
+      dispose();
+      approvals.cancelAll();
+    };
+  }, 'dsh-pet: approval projection');
 
   // /balance 斜杠命令：触发一次余额刷新（写 S → 前端 1s 轮询看到后弹气泡）。
   // fire-and-forget：回执不等外部 API（查询可能要几秒），立刻回；结果一律从 S 看

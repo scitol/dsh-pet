@@ -389,12 +389,23 @@ function applyMenuLeaf(leaf) {
   for (const s of sprites) s.menuItems = items;
 }
 
+/** 操作授权快照叶子 → 各宠物显示/收起授权卡片（同一时刻只显示队首，答完由 host 清队列）。
+ *  与 menu 一样是**当前状态**不是一次性指令：首拉也要装上，否则 helper 重启时若正好有一条
+ *  待处理审批，卡片会永远不出现（旧叶子已不在“变化”里）。 */
+function applyApprovalLeaf(leaf) {
+  const snap = S.readApprovals(leaf && typeof leaf === 'object' ? leaf : { counter: 0, data: null });
+  if (!snap) return;
+  const head = snap.pending.length > 0 ? snap.pending[0] : null;
+  for (const s of sprites) s.setApproval(head, snap.pending.length);
+}
+
 /** 跑一拍 /state。返回 true = "按长轮询命中"（宿主支持长轮询，可以立刻再请求） */
 async function pollStateOnce() {
   try {
     const s = await S.fetchState(
       STATE_URL,
       stateLongPoll && stateSince !== undefined ? { since: stateSince, timeoutMs: STATE_WAIT_MS } : undefined,
+      'desktop',
     );
     if (!s) return false;
     // 响应带 counter = 宿主支持长轮询；不带 = 老宿主（不认识 since/timeout，会立刻返回全量），
@@ -405,6 +416,8 @@ async function pollStateOnce() {
       stateBaseline = S.flattenCounters(s); // 首拉：只记基线，不渲染（避免启动/重载时重放旧气泡）
       // 第三方菜单项是**当前状态**不是事件：首拉就要装上，否则 helper 重启后要等下次注册才出现
       applyMenuLeaf(s.sections ? s.sections.menu : null);
+      // 授权队列同理：如果重启 Helper 时正好有一条待处理审批，必须立刻把卡片亮出来。
+      applyApprovalLeaf(s.sections ? s.sections.approval : null);
       return true;
     }
     for (const change of S.takeChanged(s, stateBaseline)) {
@@ -412,6 +425,7 @@ async function pollStateOnce() {
       if (change.path === 'sections.balance') applyBalanceLeaf(change.leaf);
       else if (change.path === 'sections.workStatus') applyWorkStatusLeaf(change.leaf);
       else if (change.path === 'sections.menu') applyMenuLeaf(change.leaf);
+      else if (change.path === 'sections.approval') applyApprovalLeaf(change.leaf);
       else if (change.path.startsWith('pets.') && change.path.endsWith('.say')) {
         // 宠物 id **允许含点号**：按前缀/后缀切片，绝不 split('.')
         applySayLeaf(change.path.slice('pets.'.length, -'.say'.length), change.leaf);

@@ -36,7 +36,9 @@ import {
   type PetFacing,
 } from '../shared/state';
 import { WORK_STATUS_INDEX, type WorkStatusSnapshot } from '../shared/work-status';
+import { readApprovals, type ApprovalItem } from '../shared/approval';
 import { makeBalanceBubble, makeWhisperBubble } from './bubble';
+import { ensureApprovalCss, makeApprovalCard } from './approval';
 import { clickScore, SCORE_MIN_SPEED, mountScorePopup, spawnScoreBurst } from '../shared/score-popup';
 import {
   CANVAS_H,
@@ -191,11 +193,15 @@ export function makePetUI(rt: {
 }): () => ReactNode {
   const { h, useState, useEffect, useRef } = rt;
   injectCss();
+  // 操作授权卡片：与桌面 helper 共用同一份 APPROVAL_CSS / 文案，只在网页端也显示宠物时出现。
+  ensureApprovalCss();
 
   /** 余额气泡（哑组件：数据与显隐由 PetCard 传入；展开态的两个 hook 由这里注入） */
   const BalanceBubble = makeBalanceBubble({ h, useState, useEffect });
   /** 碎碎念气泡（哑组件：文本与显隐由 PetCard 传入） */
   const WhisperBubble = makeWhisperBubble({ h });
+  /** 操作授权卡片（哑组件：队列/忙/错状态都由容器 PetMulti 持有） */
+  const ApprovalCard = makeApprovalCard(h);
 
   /** 单个宠物实例（配置由容器 PetMulti 传入；碎碎念轮询/触发/气泡完全自理） */
   function PetCard({
@@ -218,6 +224,7 @@ export function makePetUI(rt: {
     lockTick,
     menuItemsRef,
     arena,
+    approval,
   }: {
     cfg: RuntimePet;
     balance: BalanceState | null;
@@ -259,6 +266,15 @@ export function makePetUI(rt: {
      *  注册表变化不需要重渲染任何宠物（菜单本来就是打开时现拼的）。 */
     menuItemsRef: ReactNS.MutableRefObject<MenuMoreItem[]>;
     arena: ReactNS.MutableRefObject<{ slots: Record<string, PetCollisionSlot> }>;
+    /** 操作授权：只有**第一只网页宠物**拿到它（多开时不重复摆一排同样的卡片）。
+     *  null/undefined = 这只不显示卡片。 */
+    approval?: {
+      item: ApprovalItem;
+      count: number;
+      busy: boolean;
+      error: string;
+      onAnswer: (decision: 'allowed-once' | 'rejected') => void;
+    } | null;
   }) {
     // ---- 尺寸（由配置传入；容器/设置页更新后即时跟随）----
     const [size, setSize] = useState(cfg.size);
@@ -2228,6 +2244,17 @@ export function makePetUI(rt: {
         // 碎碎念/对话气泡**不受 whisperEnabled 限制**（该字段只关自动周期轮询的触发，见上头
         // useEffect 的门控）；whisperText 只由 triggerWhisper 设置，所以说话气泡照常渲染。
         bubbleNode,
+        // 操作授权卡片（挂在头顶上方，z-index 由共享 CSS 给）；只有第一只网页宠物会拿到 approval。
+        approval
+          ? h(ApprovalCard, {
+              key: 'approval-' + approval.item.id,
+              item: approval.item,
+              count: approval.count,
+              busy: approval.busy,
+              error: approval.error,
+              onAnswer: approval.onAnswer,
+            })
+          : null,
         h('div', {
           ref: stageRef,
           className: 'dsh-pet-stage',
@@ -2367,6 +2394,48 @@ export function makePetUI(rt: {
     // 之后 counter 变了才渲染。分发到各功能（余额 / 工作状态 / 通知 / 说话）。
     // 为什么不再按"有没有启用某功能"决定要不要轮询：说话（命令触发）与宠物开关无关，
     // 今天每只宠物的 /broadcast 轮询本来就不受开关门控——统一后至少不比现在多。
+    // 操作授权（/state 的 sections.approval）：队列 + 本页提交态。多开时只在第一只网页宠物身上
+    // 摆卡片（同一队列在每只宠物身上重复摆一排没有意义，先点的一端起效）。
+    const [approvalItems, setApprovalItems] = useState<ApprovalItem[]>([]);
+    const [approvalBusy, setApprovalBusy] = useState(false);
+    const [approvalError, setApprovalError] = useState('');
+    const approvalBusyRef = useRef(false);
+    const approvalHeadRef = useRef('');
+    /** 应用一份授权快照：队首变了（答完/新来）就清掉上一条的忙/错状态。 */
+    const applyApprovalSnapshot = (pending: ApprovalItem[]): void => {
+      const head = pending[0]?.id ?? '';
+      if (head !== approvalHeadRef.current) {
+        approvalHeadRef.current = head;
+        approvalBusyRef.current = false;
+        setApprovalBusy(false);
+        setApprovalError('');
+      }
+      setApprovalItems(pending);
+    };
+    /** 点「同意 / 拒绝」：POST 回 host；成功不立刻收卡片，由 /state 的空队列来收。 */
+    const answerApproval = (decision: 'allowed-once' | 'rejected'): void => {
+      const item = approvalItems[0];
+      if (!item || approvalBusyRef.current) return;
+      approvalBusyRef.current = true;
+      setApprovalBusy(true);
+      setApprovalError('');
+      void postAction('/dsh-pet-7340/approval/answer', { id: item.id, outcome: decision }).then((ok) => {
+        if (ok) {
+          // 正常 <1s 就被 /state 清掉；5s 还没清说明状态没回来，解锁让用户重试。
+          window.setTimeout(() => {
+            if (approvalBusyRef.current && approvalHeadRef.current === item.id) {
+              approvalBusyRef.current = false;
+              setApprovalBusy(false);
+              setApprovalError('已提交，但状态还没回来');
+            }
+          }, 5000);
+          return;
+        }
+        approvalBusyRef.current = false;
+        setApprovalBusy(false);
+        setApprovalError('提交失败，请重试');
+      });
+    };
     const [sayTick, setSayTick] = useState(0);
     const sayRef = useRef<Record<string, SayCue & { seq: number }>>({});
     const [animCueTick, setAnimCueTick] = useState(0);
@@ -2403,6 +2472,11 @@ export function makePetUI(rt: {
           // 菜单项是**当前状态**不是"事件"，首拉必须装上：否则刷新页面后第三方菜单会一直是空的，
           // 要等下一次注册（写 sections.menu）才出现。
           menuItemsRef.current = readMenuItems(s.sections.menu?.data);
+          // 授权队列同理：刷新页面时若正好有一条待处理审批，必须立刻把卡片亮出来。
+          if (s.sections.approval) {
+            const approvals = readApprovals(s.sections.approval);
+            if (approvals) applyApprovalSnapshot(approvals.pending);
+          }
           return;
         }
         for (const { path, leaf } of takeChanged(s, baseline)) {
@@ -2428,6 +2502,10 @@ export function makePetUI(rt: {
           } else if (path === 'sections.menu') {
             // 第三方菜单注册表快照：只更新 ref（菜单在右键那一刻现拼），不触发任何渲染
             menuItemsRef.current = readMenuItems(leaf.data);
+          } else if (path === 'sections.approval') {
+            // 操作授权快照：队首变化 → 重渲染第一只网页宠物的卡片（空数组 = 收起）。
+            const approvals = readApprovals(leaf);
+            if (approvals) applyApprovalSnapshot(approvals.pending);
           } else if (path.startsWith('pets.') && path.endsWith('.say')) {
             // 说话叶子：路径形如 pets.<id>.say。宠物 id **允许含点号**，所以按前缀/后缀切片，
             // 绝不 split('.')（那会把 id 切碎、派发给不存在的宠物）。
@@ -2491,6 +2569,7 @@ export function makePetUI(rt: {
             s = await fetchState(
               undefined,
               longPoll && since !== undefined ? { since, timeoutMs: STATE_WAIT_MS } : undefined,
+              'web',
             );
           } catch {
             /* 轻量轮询失败静默：下一拍再试 */
@@ -2512,11 +2591,24 @@ export function makePetUI(rt: {
       };
     }, [ready]);
 
+    // 授权卡片只挂在第一只网页宠物身上：同一队列在多只宠物身上重复摆一排没有意义。
+    const approvalHead = approvalItems.length > 0 ? approvalItems[0] : null;
+    const approvalPetId = visiblePets[0]?.id;
     return ready
       ? visiblePets.map((p) =>
           h(PetCard, {
             key: p.id,
             cfg: p as RuntimePet,
+            approval:
+              approvalHead && p.id === approvalPetId
+                ? {
+                    item: approvalHead,
+                    count: approvalItems.length,
+                    busy: approvalBusy,
+                    error: approvalError,
+                    onAnswer: answerApproval,
+                  }
+                : null,
             balance,
             balanceTick,
             balanceNoticeTick,

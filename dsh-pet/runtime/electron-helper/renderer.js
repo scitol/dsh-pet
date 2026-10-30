@@ -141,6 +141,11 @@ function injectAssets() {
   const tipStyle = document.createElement('style');
   tipStyle.textContent = S.TOOLTIP_CSS;
   document.head.appendChild(tipStyle);
+  // 操作授权卡片样式（与浏览器注入同一份 APPROVAL_CSS）：卡片压在宠物身上，
+  // 两端视觉/文案严格一致。
+  const approvalStyle = document.createElement('style');
+  approvalStyle.textContent = S.APPROVAL_CSS;
+  document.head.appendChild(approvalStyle);
 }
 
 // 显示器几何变化（改分辨率/缩放、插拔屏、旋转）：主进程重算后推来，渲染端就地重挂视口与边界。

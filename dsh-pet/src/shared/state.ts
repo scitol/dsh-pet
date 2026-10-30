@@ -10,6 +10,9 @@
 import { toBalanceState, type BalanceState } from './balance';
 import { toWorkStatus, type WorkStatusSnapshot } from './work-status';
 
+/** 哪一端在轮询 /state：宿主用它判断“此刻有没有渲染端能展示并回答审批”。 */
+export type StateSurface = 'web' | 'desktop';
+
 /** 一个叶子：计数器 + 载荷（data 为 null = 还没有数据，消费端跳过） */
 export interface StateLeaf {
   counter: number;
@@ -46,13 +49,23 @@ function normLeaf(value: unknown): StateLeaf | null {
  *
  * `wait` 传了就带 `?since=&timeout=` 走**长轮询**：宿主在"版本没变"时挂起，直到任意叶子被写过
  * （立刻返回）或超时。不传 = 立刻返回全量（改造前的语义）。
+ * `surface` 是“哪一端还在轮询”的租约：host 据此判断有没有渲染端能替用户作答
+ * （approval/request 只有在这种时候才接到桌宠上，否则回落到官方审批面板）。
  */
 export async function fetchState(
   baseUrl = '/dsh-pet-7340/state',
   wait?: { since: number; timeoutMs: number },
+  surface?: StateSurface,
 ): Promise<PollState | null> {
   try {
-    const url = wait ? `${baseUrl}?since=${wait.since}&timeout=${wait.timeoutMs}` : baseUrl;
+    const query = new URLSearchParams();
+    if (wait) {
+      query.set('since', String(wait.since));
+      query.set('timeout', String(wait.timeoutMs));
+    }
+    if (surface) query.set('surface', surface);
+    const qs = query.toString();
+    const url = qs ? `${baseUrl}?${qs}` : baseUrl;
     const res = await fetch(url, { cache: 'no-store' });
     if (!res.ok) return null;
     const raw = (await res.json().catch(() => null)) as {
